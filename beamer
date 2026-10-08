@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""beamer — plug-and-play HDMI / projector handling for Hyprland (Lua config).
+
+Usage:
+  beamer daemon            listen for hotplug events and auto-configure (run from Hyprland autostart)
+  beamer mirror            laptop screen mirrored on the external screen
+  beamer extend            external screen as a second desktop (right of the laptop)
+  beamer external          only the external screen, laptop panel off
+  beamer internal          only the laptop screen
+  beamer cycle             mirror -> extend -> external -> internal -> mirror ...
+  beamer status            show monitors, current mode and audio sink
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+MODES = ["mirror", "extend", "external", "internal"]
+
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "beamer" / "config.toml"
+STATE_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "beamer" / "mode"
+
+DEFAULTS = {
+    "internal": "eDP-1",        # laptop panel connector
+    "internal_scale": 1.25,     # scale of the laptop panel
+    "default_mode": "mirror",   # mode applied when a screen is plugged in
+    "remember_mode": False,     # true: reuse the last mode picked with `beamer <mode>` instead of default_mode
+    "switch_audio": True,       # move sound to HDMI while connected, back afterwards
+    "notify": True,             # desktop notification on changes
+}
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if CONFIG_PATH.exists():
+        with CONFIG_PATH.open("rb") as f:
+            cfg.update(tomllib.load(f))
+    if cfg["default_mode"] not in MODES:
+        cfg["default_mode"] = "mirror"
+    return cfg
+
+
+# ---------------------------------------------------------------- helpers
+
+def run(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+
+def notify(cfg, msg):
+    if cfg["notify"]:
+        run("notify-send", "-a", "beamer", "-i", "video-display", "Display", msg)
+    print(msg, flush=True)
+
+
+def hypr_eval(lua):
+    out = run("hyprctl", "eval", lua).strip()
+    if out != "ok":
+        print(f"hyprctl eval failed: {out!r} for {lua}", file=sys.stderr)
+
+
+def monitor_rule(output, **fields):
+    parts = [f'output = "{output}"']
+    for key, val in fields.items():
+        if isinstance(val, bool):
+            parts.append(f"{key} = {'true' if val else 'false'}")
+        elif isinstance(val, (int, float)):
+            parts.append(f"{key} = {val}")
+        else:
+            parts.append(f'{key} = "{val}"')
+    hypr_eval("hl.monitor({ " + ", ".join(parts) + " })")
+
+
+def monitors():
+    try:
+        return json.loads(run("hyprctl", "-j", "monitors", "all") or "[]")
+    except json.JSONDecodeError:
+        return []
+
+
+def externals(cfg):
+    return [m for m in monitors() if m["name"] != cfg["internal"]]
+
+
+def scale_for(mon):
+    """Pick a scale that divides the preferred resolution evenly."""
+    modes = mon.get("availableModes") or []
+    width = int(modes[0].split("x")[0]) if modes else mon.get("width", 0)
+    return 1.5 if width >= 3200 else 1
+
+
+def read_state():
+    try:
+        mode = STATE_PATH.read_text().strip()
+        return mode if mode in MODES else None
+    except OSError:
+        return None
+
+
+def write_state(mode):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(mode)
+
+
+# ---------------------------------------------------------------- audio
+
+def sinks():
+    try:
+        return json.loads(run("pactl", "-f", "json", "list", "sinks") or "[]")
+    except json.JSONDecodeError:
+        return []
+
+
+def plugged_hdmi_sink():
+    for s in sinks():
+        if "hdmi" not in s["name"].lower():
+            continue
+        if any(p.get("availability") != "not available" for p in s.get("ports", [])) or not s.get("ports"):
+            return s["name"]
+    return None
+
+
+def internal_sink():
+    for s in sinks():
+        if "hdmi" not in s["name"].lower():
+            return s["name"]
+    return None
+
+
+def set_audio(cfg, to_hdmi):
+    if not cfg["switch_audio"]:
+        return
+    # HDMI audio jacks often report a moment after the display does
+    sink = None
+    for _ in range(6 if to_hdmi else 1):
+        sink = plugged_hdmi_sink() if to_hdmi else internal_sink()
+        if sink:
+            break
+        time.sleep(0.5)
+    if sink and run("pactl", "get-default-sink").strip() != sink:
+        run("pactl", "set-default-sink", sink)
+
+
+# ---------------------------------------------------------------- modes
+
+def apply(cfg, mode, quiet=False):
+    internal = cfg["internal"]
+    ext = externals(cfg)
+
+    if not ext:
+        monitor_rule(internal, mode="preferred", position="0x0", scale=cfg["internal_scale"])
+        set_audio(cfg, False)
+        if not quiet:
+            notify(cfg, "No external screen connected")
+        return
+
+    # never leave the user without any screen
+    monitor_rule(internal, mode="preferred", position="0x0", scale=cfg["internal_scale"],
+                 disabled=(mode == "external"))
+
+    for m in ext:
+        name = m["name"]
+        if mode == "mirror":
+            monitor_rule(name, mode="preferred", position="auto", scale=1, mirror=internal)
+        elif mode == "extend":
+            monitor_rule(name, mode="preferred", position="auto-right", scale=scale_for(m))
+        elif mode == "external":
+            monitor_rule(name, mode="preferred", position="0x0", scale=scale_for(m))
+        elif mode == "internal":
+            monitor_rule(name, disabled=True)
+
+    set_audio(cfg, mode != "internal")
+    if not quiet:
+        names = ", ".join(m["name"] for m in ext)
+        notify(cfg, f"{mode.capitalize()} ({names})")
+
+
+def current_mode():
+    return read_state() or load_config()["default_mode"]
+
+
+def cmd_set(mode):
+    cfg = load_config()
+    write_state(mode)
+    apply(cfg, mode)
+
+
+def cmd_cycle():
+    mode = MODES[(MODES.index(current_mode()) + 1) % len(MODES)]
+    cmd_set(mode)
+
+
+def cmd_status():
+    cfg = load_config()
+    print(f"mode: {current_mode()}   (default on plug-in: {cfg['default_mode']})")
+    for m in monitors():
+        state = "disabled" if m.get("disabled") else f"{m['width']}x{m['height']}@{m['refreshRate']:.0f} scale {m['scale']}"
+        mirror = f" mirrors {m['mirrorOf']}" if m.get("mirrorOf") not in (None, "none") else ""
+        print(f"  {m['name']:10} {state}{mirror}  [{m.get('description', '')}]")
+    print(f"audio: {run('pactl', 'get-default-sink').strip()}")
+
+
+# ---------------------------------------------------------------- daemon
+
+def event_socket():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        sys.exit("HYPRLAND_INSTANCE_SIGNATURE not set — run this inside Hyprland")
+    path = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "hypr" / sig / ".socket2.sock"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(str(path))
+    return sock
+
+
+def plug_mode(cfg):
+    return (read_state() if cfg["remember_mode"] else None) or cfg["default_mode"]
+
+
+def cmd_daemon():
+    cfg = load_config()
+    if not cfg["remember_mode"]:
+        write_state(cfg["default_mode"])
+    # a screen may already be connected at login
+    if externals(cfg):
+        apply(cfg, plug_mode(cfg))
+
+    sock = event_socket()
+    buf = b""
+    while True:
+        data = sock.recv(4096)
+        if not data:
+            return  # Hyprland exited
+        buf += data
+        *lines, buf = buf.split(b"\n")
+        for line in lines:
+            event, _, payload = line.decode(errors="replace").partition(">>")
+            if event == "monitoradded" and payload != cfg["internal"]:
+                cfg = load_config()
+                time.sleep(0.5)  # let the output settle before re-ruling it
+                mode = plug_mode(cfg)
+                write_state(mode)
+                apply(cfg, mode)
+            elif event == "monitorremoved" and payload != cfg["internal"]:
+                cfg = load_config()
+                if not externals(cfg):
+                    apply(cfg, "internal", quiet=True)
+                    notify(cfg, f"{payload} disconnected — back to laptop screen")
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if arg in MODES:
+        cmd_set(arg)
+    elif arg == "cycle":
+        cmd_cycle()
+    elif arg == "status":
+        cmd_status()
+    elif arg == "daemon":
+        cmd_daemon()
+    else:
+        print(__doc__)
+        sys.exit(0 if arg in ("-h", "--help", "help") else 1)
+
+
+if __name__ == "__main__":
+    main()

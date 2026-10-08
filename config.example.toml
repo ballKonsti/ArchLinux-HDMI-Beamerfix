@@ -1,0 +1,7 @@
+# ~/.config/beamer/config.toml
+internal       = "eDP-1"   # laptop panel connector (see `hyprctl monitors`)
+internal_scale = 1.25      # scale of the laptop panel only
+default_mode   = "mirror"  # mirror | extend | external | internal — used when a screen is plugged in
+remember_mode  = false     # true: reuse the last mode you picked instead of default_mode
+switch_audio   = true      # send sound over HDMI while connected
+notify         = true      # show a notification on every change
