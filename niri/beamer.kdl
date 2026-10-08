@@ -1,0 +1,7 @@
+// beamer: add these to ~/.config/niri/config.kdl
+spawn-at-startup "@BIN@" "daemon"
+
+binds {
+    Mod+P { spawn "@BIN@" "ui"; }
+    Mod+Shift+P { spawn "@BIN@" "mirror"; }
+}

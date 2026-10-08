@@ -1,0 +1,7 @@
+-std=c++23
+-Wall
+-Wextra
+-I../build
+-Ibuild
+-Isrc
+-I../src
